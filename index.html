@@ -1758,7 +1758,23 @@ html[dir="rtl"] .btn { font-size: 13px; }
           <!-- ☁ CLOUD SYNC CONFIGURATION -->
           <div style="background:rgba(37,99,235,.08);border:1.5px solid rgba(37,99,235,.3);border-radius:var(--r);padding:14px;margin-bottom:14px">
             <div style="font-family:var(--H);font-size:13px;font-weight:800;color:#88AAFF;margin-bottom:4px;display:flex;align-items:center;gap:7px">☁ Cloud Sync Configuration</div>
-            <div style="font-size:11px;color:var(--mid);margin-bottom:12px;line-height:1.6">Connect to a shared backend so all 50+ team members see the same data in real time. Paste <strong>one</strong> URL below — either Google Sheets or SharePoint/Power Automate.</div>
+            <div style="font-size:11px;color:var(--mid);margin-bottom:12px;line-height:1.6">Connect to a shared backend so all devices see the same data in real time.</div>
+
+            <!-- ── Backend API URL (Node.js server) ── -->
+            <div style="background:rgba(34,170,68,.08);border:1.5px solid rgba(34,170,68,.25);border-radius:var(--rs);padding:11px 13px;margin-bottom:12px">
+              <div style="font-family:var(--H);font-size:12px;font-weight:800;color:var(--gr);margin-bottom:6px">🖥 Backend API URL <span style="font-size:10px;font-weight:400;color:var(--mid)">(Node.js server — recommended for multi-device)</span></div>
+              <div class="field" style="margin-bottom:6px">
+                <input type="text" id="api-base-url" placeholder="http://localhost:4000  or  https://your-server.com"
+                  style="font-size:11px;background:var(--card);border:1.5px solid rgba(34,170,68,.35);color:var(--txt)"
+                  oninput="apiBaseSaveConfig()">
+              </div>
+              <div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap">
+                <button class="btn btn-sm" style="background:var(--gr);color:#fff;border:none" onclick="apiBaseTest()">🔗 Test Backend</button>
+                <button class="btn btn-sm btn-d" onclick="apiBaseClear()">✕ Clear</button>
+                <div id="api-base-status" style="font-size:11px;color:var(--mid)"></div>
+              </div>
+              <div style="font-size:10px;color:var(--mid);margin-top:6px">Run <code style="background:var(--panel);padding:1px 5px;border-radius:3px">node server.js</code> on your PC/server, then paste the URL above. Employees, audits and Kaizens will sync across all devices.</div>
+            </div>
 
             <div class="field" style="margin-bottom:10px">
               <label style="color:#88AAFF">Google Sheets Apps Script URL</label>
@@ -3772,7 +3788,7 @@ html[dir="rtl"] .btn { font-size: 13px; }
 <!-- ══════════════════════════════════════
      JAVASCRIPT — Unified Engine
 ══════════════════════════════════════ -->
-<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script>
+<script>
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════════
@@ -3976,22 +3992,24 @@ function syncUpdateIndicator(){
   }
 }
 
-// ── Generic API call with offline queue ───────────────────────────
+// ── Generic API call ─────────────────────────────────────────────
+// Google Apps Script requires no-cors for POST (opaque response).
+// We use a callback/jsonp-style GET for reading data back instead.
 async function syncCall(action, payload){
   if(!_sync.active) return null;
   const url = _sync.backend==='google' ? CLOUD.googleSheetsUrl : CLOUD.sharepointUrl;
   const body = JSON.stringify({ action, ...payload, _source:'TESCO_5S_Suite', _ts: Date.now() });
   try{
     _sync.status='syncing'; syncUpdateIndicator();
-    const resp = await fetch(url, {
+    // Google Apps Script: POST with no-cors (fire-and-forget, opaque response — always treated as ok)
+    // SharePoint/Power Automate: POST with cors (returns readable JSON)
+    await fetch(url, {
       method:'POST',
-      headers:{'Content-Type':'application/json'},
+      headers:{'Content-Type':'text/plain'},  // text/plain avoids preflight on Apps Script
       mode: _sync.backend==='google' ? 'no-cors' : 'cors',
       body
     });
-    // Google Apps Script with no-cors returns opaque response (always ok)
     _sync.status='ok'; _sync.lastPush=Date.now(); syncUpdateIndicator();
-    // Flush offline queue
     if(_sync.pending.length) syncFlushQueue();
     return true;
   } catch(err){
@@ -4004,37 +4022,61 @@ async function syncCall(action, payload){
   }
 }
 
-// ── Pull all data from cloud (GET) ────────────────────────────────
+// ── Pull all data from cloud ──────────────────────────────────────
+// Google Apps Script supports JSONP via ?callback=fn for cross-origin GET reads.
+// This sidesteps the CORS restriction entirely.
 async function syncPull(){
   if(!_sync.active) return;
-  // SharePoint uses GET endpoint; Google uses POST with action=getAll
-  const url = _sync.backend==='google'
-    ? CLOUD.googleSheetsUrl + '?action=getAll&_source=TESCO_5S_Suite'
-    : CLOUD.sharepointUrl + '&action=getAll';
   try{
     _sync.status='syncing'; syncUpdateIndicator();
-    const resp = await fetch(url, {method:'GET', mode:'cors'});
-    if(!resp.ok) throw new Error('HTTP '+resp.status);
-    const data = await resp.json();
+    let data = null;
+
+    if(_sync.backend==='google'){
+      // Use JSONP: inject a <script> tag, Apps Script returns fn({...})
+      data = await new Promise((resolve, reject) => {
+        const cbName = '_tesco5sCb_' + Date.now();
+        const script = document.createElement('script');
+        const timeout = setTimeout(() => {
+          delete window[cbName];
+          script.remove();
+          reject(new Error('JSONP timeout'));
+        }, 10000);
+        window[cbName] = function(d){
+          clearTimeout(timeout);
+          delete window[cbName];
+          script.remove();
+          resolve(d);
+        };
+        script.src = CLOUD.googleSheetsUrl + '?action=getAll&callback=' + cbName + '&_=' + Date.now();
+        script.onerror = () => { clearTimeout(timeout); delete window[cbName]; script.remove(); reject(new Error('Script load error')); };
+        document.head.appendChild(script);
+      });
+    } else {
+      // SharePoint: standard cors GET
+      const resp = await fetch(CLOUD.sharepointUrl + '&action=getAll', {method:'GET', mode:'cors'});
+      if(!resp.ok) throw new Error('HTTP ' + resp.status);
+      data = await resp.json();
+    }
+
+    if(!data) throw new Error('No data returned');
     let changed = false;
     if(data.audits && Array.isArray(data.audits)){
-      // Merge: keep local records not in cloud + all cloud records
       const merged = mergeRecords(audits(), data.audits, 'serial');
-      sv(K.A, merged); changed=true;
+      sv(K.A, merged); changed = true;
     }
     if(data.kaizens && Array.isArray(data.kaizens)){
       const merged = mergeRecords(kzs(), data.kaizens, 'serial');
-      sv(K.Z, merged); changed=true;
+      sv(K.Z, merged); changed = true;
     }
     if(data.points && typeof data.points==='object'){
-      const local = pts();
-      sv(K.P, {...data.points, ...local}); changed=true;
+      sv(K.P, {...data.points, ...pts()}); changed = true;
     }
     _sync.status='ok'; _sync.lastPull=Date.now(); syncUpdateIndicator();
     if(changed){ refresh(); refreshHub(); toast('☁ Data synced from cloud','ok',2500); }
   } catch(err){
     _sync.status = navigator.onLine ? 'error' : 'offline';
     syncUpdateIndicator();
+    console.warn('[CloudSync] Pull failed:', err.message);
   }
 }
 
@@ -6265,6 +6307,26 @@ window.addEventListener('DOMContentLoaded',()=>{
   // Restore employee session
   empRestoreSession();
 
+  // ── Pull data from backend on startup (multi-device sync) ─────────
+  if(false && _apiEnabled()){
+    fetch(API_BASE+'/data/all')
+      .then(r=>r.ok?r.json():null)
+      .then(data=>{
+        if(!data) return;
+        let changed=false;
+        if(data.audits&&data.audits.length){
+          const merged=mergeRecords(audits(),data.audits,'serial');
+          sv(K.A,merged); changed=true;
+        }
+        if(data.kaizens&&data.kaizens.length){
+          const merged=mergeRecords(kzs(),data.kaizens,'serial');
+          sv(K.Z,merged); changed=true;
+        }
+        if(changed){ refresh(); refreshHub(); toast('☁ Data loaded from backend','ok',2500); }
+      })
+      .catch(()=>{ /* offline — use local data */ });
+  }
+
   // Keyboard shortcut: Ctrl+K / Cmd+K to open search
   document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='k'){e.preventDefault();openSearch();}});
 });
@@ -6756,10 +6818,15 @@ document.addEventListener('DOMContentLoaded',()=>{
 // ═══════════════════════════════════════════════════════════════════
 // v5 — DATA STORES
 // ═══════════════════════════════════════════════════════════════════
-const K_EMP='5s_employees';         // registered employee accounts
+const K_EMP='5s_employees';         // registered employee accounts (local cache)
 const K_RPT='5s_saved_reports';     // serial-numbered saved reports
 const K_SES='5s_session';           // current logged-in employee
 
+// ── API base URL — change this to your backend URL ─────────────────
+// Leave empty ('') to use localStorage-only mode (offline/standalone)
+const API_BASE = 'http://localhost:4000/api';   // e.g. 'https://your-backend.com' or 'http://localhost:4000/api'
+
+// ── empAccounts: read from local cache (kept in sync after each API call) ──
 const empAccounts=()=>{try{return JSON.parse(localStorage.getItem(K_EMP)||'{}');}catch{return {};}};
 const saveEmpAccounts=v=>{try{localStorage.setItem(K_EMP,JSON.stringify(v));}catch{toast('Storage full','wn');}};
 const savedReports=()=>{try{return JSON.parse(localStorage.getItem(K_RPT)||'[]');}catch{return [];}};
@@ -6897,51 +6964,157 @@ function empTabSwitch(tab){
   document.getElementById('emp-tab-reg').style.color=tab==='register'?'#fff':'var(--mid)';
 }
 
-function empLogin(){
-  const id=(document.getElementById('login-id').value||'').trim().toUpperCase();
-  const pin=(document.getElementById('login-pin').value||'').trim();
-  const msg=document.getElementById('login-msg');
-  if(!id||!pin){msg.textContent='Please enter Employee ID and PIN.';return;}
-  const accs=empAccounts();
-  if(!accs[id]){msg.textContent='Employee ID not found. Please register first.';return;}
-  if(accs[id].pin!==pin){msg.textContent='Incorrect PIN. Please try again.';return;}
-  _currentEmployee={...accs[id]};
-  try{localStorage.setItem(K_SES,JSON.stringify(_currentEmployee));}catch{}
-  empUpdateHeader();
-  closeEmpModal();
-  // Auto-fill audit & kaizen forms with employee info
-  empAutoFill();
-  toast(`Welcome back, ${_currentEmployee.name}!`,'ok',4000);
+// ── Helper: is a backend URL configured? ──────────────────────────
+function _apiEnabled(){ return typeof API_BASE==='string' && API_BASE.trim()!==''; }
+
+// ── Helper: set session in memory + localStorage ───────────────────
+function _empSetSession(empData){
+  _currentEmployee = empData;
+  try{ localStorage.setItem(K_SES, JSON.stringify(empData)); }catch{}
+  // Update local cache so empAccounts() stays consistent
+  try{
+    const accs = empAccounts();
+    accs[empData.id] = empData;
+    saveEmpAccounts(accs);
+  }catch{}
 }
 
-function empRegister(){
-  const name=(document.getElementById('reg-name').value||'').trim();
-  const id=(document.getElementById('reg-id').value||'').trim().toUpperCase();
-  const zone=document.getElementById('reg-zone').value;
-  const role=document.getElementById('reg-role').value;
-  const leader=(document.getElementById('reg-leader').value||'').trim();
-  const pin=(document.getElementById('reg-pin').value||'').trim();
-  const pin2=(document.getElementById('reg-pin2').value||'').trim();
-  const msg=document.getElementById('reg-msg');
-  if(!name||!id||!zone||!pin){msg.textContent='Please fill all required fields.';return;}
-  if(pin.length<4){msg.textContent='PIN must be 4–6 digits.';return;}
-  if(pin!==pin2){msg.textContent='PINs do not match.';return;}
-  const accs=empAccounts();
-  if(accs[id]){msg.textContent='Employee ID already registered. Use Sign In.';return;}
-  accs[id]={id,name,zone,role,leader,pin,registeredAt:new Date().toISOString()};
-  saveEmpAccounts(accs);
-  _currentEmployee={id,name,zone,role,leader};
-  try{localStorage.setItem(K_SES,JSON.stringify(_currentEmployee));}catch{}
-  empUpdateHeader();
-  closeEmpModal();
-  empAutoFill();
-  toast(`Account created! Welcome, ${name}.`,'ok',4000);
+// ── empLogin — tries API first, falls back to localStorage ────────
+async function empLogin(){
+  const id  = (document.getElementById('login-id').value||'').trim().toUpperCase();
+  const pin = (document.getElementById('login-pin').value||'').trim();
+  const msg = document.getElementById('login-msg');
+  if(!id||!pin){ msg.textContent='Please enter Employee ID and PIN.'; return; }
+
+  // Disable button during request
+  const btn = document.querySelector('#emp-login-panel .btn-r');
+  if(btn){ btn.disabled=true; btn.textContent='Signing in…'; }
+
+  try{
+    if(_apiEnabled()){
+      // ── API path ──────────────────────────────────────────────────
+      const resp = await fetch(API_BASE+'/auth/login', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({id, pin})
+      });
+      const data = await resp.json();
+      if(!resp.ok){
+        msg.textContent = data.message || data.error || 'Login failed. Please try again.';
+        return;
+      }
+      const emp = data.employee || data.user || data;
+      _empSetSession({id:emp.id||id, name:emp.name, zone:emp.zone||'', role:emp.role||'Employee', leader:emp.leader||''});
+      empUpdateHeader(); closeEmpModal(); empAutoFill();
+      toast('Welcome back, '+_currentEmployee.name+'!','ok',4000);
+    } else {
+      // ── localStorage fallback ──────────────────────────────────────
+      const accs = empAccounts();
+      if(!accs[id]){ msg.textContent='Employee ID not found. Please register first.'; return; }
+      if(accs[id].pin!==pin){ msg.textContent='Incorrect PIN. Please try again.'; return; }
+      _empSetSession({...accs[id]});
+      empUpdateHeader(); closeEmpModal(); empAutoFill();
+      toast('Welcome back, '+_currentEmployee.name+'!','ok',4000);
+    }
+  } catch(err){
+    console.warn('[empLogin] API error:', err.message);
+    // Network error — fall back to localStorage silently
+    const accs = empAccounts();
+    if(accs[id] && accs[id].pin===pin){
+      _empSetSession({...accs[id]});
+      empUpdateHeader(); closeEmpModal(); empAutoFill();
+      toast('Welcome back, '+_currentEmployee.name+'! (offline mode)','ok',4000);
+    } else {
+      msg.textContent = 'Cannot reach server. Check your connection.';
+    }
+  } finally {
+    if(btn){ btn.disabled=false; btn.textContent='Sign In'; }
+  }
 }
 
+// ── empRegister — tries API first, falls back to localStorage ─────
+async function empRegister(){
+  const name   = (document.getElementById('reg-name').value||'').trim();
+  const id     = (document.getElementById('reg-id').value||'').trim().toUpperCase();
+  const zone   = document.getElementById('reg-zone').value;
+  const role   = document.getElementById('reg-role').value;
+  const leader = (document.getElementById('reg-leader').value||'').trim();
+  const pin    = (document.getElementById('reg-pin').value||'').trim();
+  const pin2   = (document.getElementById('reg-pin2').value||'').trim();
+  const msg    = document.getElementById('reg-msg');
+
+  if(!name||!id||!zone||!pin){ msg.textContent='Please fill all required fields.'; return; }
+  if(pin.length<4){ msg.textContent='PIN must be 4–6 digits.'; return; }
+  if(pin!==pin2){ msg.textContent='PINs do not match.'; return; }
+
+  const btn = document.querySelector('#emp-reg-panel .btn-r');
+  if(btn){ btn.disabled=true; btn.textContent='Registering…'; }
+
+  try{
+    if(_apiEnabled()){
+      // ── API path ──────────────────────────────────────────────────
+      const resp = await fetch(API_BASE+'/auth/register', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({id, name, zone, role, leader, pin, registeredAt:new Date().toISOString()})
+      });
+      const data = await resp.json();
+      if(!resp.ok){
+        msg.textContent = data.message || data.error || 'Registration failed.';
+        return;
+      }
+      _empSetSession({id, name, zone, role, leader});
+      empUpdateHeader(); closeEmpModal(); empAutoFill();
+      toast('Account created! Welcome, '+name+'.','ok',4000);
+      // Refresh employee list in Manager Panel if open
+      if(typeof mgrRenderEmployees==='function') setTimeout(mgrRenderEmployees, 500);
+    } else {
+      // ── localStorage fallback ──────────────────────────────────────
+      const accs = empAccounts();
+      if(accs[id]){ msg.textContent='Employee ID already registered. Use Sign In.'; return; }
+      accs[id] = {id, name, zone, role, leader, pin, registeredAt:new Date().toISOString()};
+      saveEmpAccounts(accs);
+      _empSetSession({id, name, zone, role, leader});
+      empUpdateHeader(); closeEmpModal(); empAutoFill();
+      toast('Account created! Welcome, '+name+'.','ok',4000);
+    }
+  } catch(err){
+    console.warn('[empRegister] API error:', err.message);
+    // Network error — fall back to localStorage
+    const accs = empAccounts();
+    if(accs[id]){ msg.textContent='Employee ID already registered. Use Sign In.'; return; }
+    accs[id] = {id, name, zone, role, leader, pin, registeredAt:new Date().toISOString()};
+    saveEmpAccounts(accs);
+    _empSetSession({id, name, zone, role, leader});
+    empUpdateHeader(); closeEmpModal(); empAutoFill();
+    toast('Account created (offline mode)! Welcome, '+name+'.','ok',4000);
+  } finally {
+    if(btn){ btn.disabled=false; btn.textContent='Create Account'; }
+  }
+}
+
+// ── empRestoreSession — restore from localStorage, validate with API ─
 function empRestoreSession(){
   try{
-    const s=JSON.parse(localStorage.getItem(K_SES)||'null');
-    if(s&&s.id){_currentEmployee=s;empUpdateHeader();empAutoFill();}
+    const s = JSON.parse(localStorage.getItem(K_SES)||'null');
+    if(s && s.id){
+      _currentEmployee = s;
+      empUpdateHeader();
+      empAutoFill();
+      // If API enabled, silently refresh employee data in background
+      if(_apiEnabled()){
+        fetch(API_BASE+'/auth/users')
+          .then(r=>r.ok?r.json():null)
+          .then(data=>{
+            if(!data) return;
+            const list = Array.isArray(data) ? data : (data.employees||[]);
+            const accs = {};
+            list.forEach(e=>{ if(e.id) accs[e.id]=e; });
+            if(Object.keys(accs).length) saveEmpAccounts(accs);
+          })
+          .catch(()=>{/* offline — use cached data */});
+      }
+    }
   }catch{}
 }
 
@@ -7158,10 +7331,17 @@ window.exportAuditReport=function(){
   </div></body></html>`;
   // Save with serial number
   saveReport('audit',serial,`5S Audit — ${zone}`,zone,date,auditor,html);
-  // ☁ Push to cloud if configured
+  // ☁ Push to cloud (Apps Script sync)
   if(_sync.active){
     const auditRecord = audits().find(a=>a.serial===serial) || {serial,zone,date,auditor,totalScore:total,status};
     syncPushAudit(auditRecord).then(ok=>{ if(ok) toast(`☁ Synced to cloud: ${serial}`,'ok',2000); });
+  }
+  // ── API backend push (multi-device sync) ──────────────────────────
+  if(_apiEnabled()){
+    const auditRec = audits().find(a=>a.serial===serial) || {serial,zone,date,auditor,totalScore:total,status,teamLeader:val('a-leader'),pillarScores:{s1:getPillarScore('s1'),s2:getPillarScore('s2'),s3:getPillarScore('s3'),s4:getPillarScore('s4'),s5:getPillarScore('s5')}};
+    fetch(API_BASE+'/audits',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(auditRec)})
+      .then(r=>r.ok?toast('☁ Audit synced to backend','ok',2000):null)
+      .catch(()=>{});
   }
   // Open in new window
   const blob=new Blob(['\uFEFF'+html],{type:'text/html;charset=utf-8'});
@@ -7269,10 +7449,17 @@ window.printKaizen=function(){
   <div class="ftr">TESCO Engineering · 5S &amp; Kaizen Continuous Improvement Program · ${serial} · © 2026 TESCO Engineering · All Rights Reserved</div>
   </div></body></html>`;
   saveReport('kaizen',serial,title,zone,date,emp,html);
-  // ☁ Push to cloud if configured
+  // ☁ Push to cloud (Apps Script sync)
   if(_sync.active){
     const kzRecord = kzs().find(k=>k.serial===serial)||{serial,title,zone,date,employeeName:emp,workflowStage:_kWorkflowStage||'Submitted'};
     syncPushKaizen(kzRecord).then(ok=>{ if(ok) toast(`☁ Synced to cloud: ${serial}`,'ok',2000); });
+  }
+  // ── API backend push (multi-device sync) ──────────────────────────
+  if(_apiEnabled()){
+    const kzRec = kzs().find(k=>k.serial===serial)||{serial,reportTitle:title,zone,date,employeeName:emp,workflowStage:_kWorkflowStage||'Submitted',status:KState.status||'Open',priority:KState.priority||'',pointsAwarded:parseInt(val('k-pts'))||10,problemDesc:val('k-prob'),actionDesc:val('k-act')};
+    fetch(API_BASE+'/kaizens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(kzRec)})
+      .then(r=>r.ok?toast('☁ Kaizen synced to backend','ok',2000):null)
+      .catch(()=>{});
   }
   const blobK=new Blob(['\uFEFF'+html],{type:'text/html;charset=utf-8'});
   const wK=window.open(URL.createObjectURL(blobK),'_blank');
@@ -7812,6 +7999,57 @@ function syncLoadConfig(){
     syncDetectBackend();
     syncUpdateStatusDisplay();
   }catch{}
+  // Also restore API_BASE from localStorage
+  try{
+    const saved = localStorage.getItem('5s_api_base')||'';
+    if(saved){
+      window.API_BASE = saved;
+      const el = document.getElementById('api-base-url');
+      if(el) el.value = saved;
+      const st = document.getElementById('api-base-status');
+      if(st) st.innerHTML = '<span style="color:var(--gr)">✅ Configured: '+saved+'</span>';
+    }
+  }catch{}
+}
+
+// ── Backend API URL — save/test/clear ─────────────────────────────
+function apiBaseSaveConfig(){
+  const el = document.getElementById('api-base-url');
+  const url = (el ? el.value : '').trim().replace(/\/+$/,'');
+  window.API_BASE = url;
+  try{ if(url) localStorage.setItem('5s_api_base', url); else localStorage.removeItem('5s_api_base'); }catch{}
+  const st = document.getElementById('api-base-status');
+  if(st) st.textContent = url ? 'Saved — click Test to verify' : 'Cleared';
+}
+async function apiBaseTest(){
+  const url = (window.API_BASE||'').trim().replace(/\/+$/,'');
+  const st  = document.getElementById('api-base-status');
+  if(!url){ if(st) st.innerHTML='<span style="color:var(--am)">⚠ No URL entered</span>'; return; }
+  if(st) st.innerHTML='<span style="color:var(--bl)">🔄 Testing…</span>';
+  try{
+    const resp = await fetch(url+'/api/health', {signal: AbortSignal.timeout(5000)});
+    const data = resp.ok ? await resp.json() : null;
+    if(resp.ok && data){
+      const empCount = data.employees !== undefined ? ' · '+data.employees+' employees' : '';
+      const sheets   = data.sheetsConnected ? ' · Sheets ✅' : ' · Sheets ❌';
+      if(st) st.innerHTML='<span style="color:var(--gr)">✅ Connected'+empCount+sheets+'</span>';
+      toast('✅ Backend connected successfully!','ok',3000);
+    } else {
+      if(st) st.innerHTML='<span style="color:var(--red)">❌ Server returned error '+resp.status+'</span>';
+    }
+  }catch(err){
+    if(st) st.innerHTML='<span style="color:var(--red)">❌ Cannot reach server — is it running?</span>';
+    toast('Cannot reach backend: '+url,'er',4000);
+  }
+}
+function apiBaseClear(){
+  window.API_BASE = '';
+  try{ localStorage.removeItem('5s_api_base'); }catch{}
+  const el = document.getElementById('api-base-url');
+  if(el) el.value = '';
+  const st = document.getElementById('api-base-status');
+  if(st) st.textContent = 'Cleared';
+  toast('Backend URL cleared — using localStorage mode','wn',3000);
 }
 function syncSaveConfig(){
   const gUrl = (document.getElementById('sync-google-url')||{}).value||'';
@@ -8101,10 +8339,23 @@ function mgrSaveSerials(){
 }
 
 // ── Employee Management ───────────────────────────────────────────
-function mgrRenderEmployees(){
+async function mgrRenderEmployees(){
+  const el=document.getElementById('mgr-employees-list');
+  // Try to pull fresh list from API if enabled
+  if(_apiEnabled()){
+    try{
+      const resp = await fetch(API_BASE+'/auth/users');
+      if(resp.ok){
+        const data = await resp.json();
+        const list = Array.isArray(data) ? data : (data.employees||[]);
+        const accs = {};
+        list.forEach(e=>{ if(e.id) accs[e.id]=e; });
+        if(Object.keys(accs).length) saveEmpAccounts(accs);
+      }
+    }catch(e){ /* offline — use cache */ }
+  }
   const accs=empAccounts();
   const list=Object.values(accs);
-  const el=document.getElementById('mgr-employees-list');
   if(!list.length){ el.innerHTML='<div class="empty-c" style="padding:24px">No registered employees.</div>'; return; }
   el.innerHTML=list.map(e=>`<div class="emp-mgr-row">
     <div class="emp-mgr-av">${(e.name||'?').slice(0,1).toUpperCase()}</div>
